@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [0.1.2] - 2026-11-08
 
+### Fixed
+
+- Words already delivered in an earlier final are no longer repeated when a `Finalize` lands
+  mid-word (for example "coffee shops" followed by "shop" and "shops near me"), in finals and
+  interims.
+- When the pipeline has a local VAD, results that arrive while nobody is speaking (faint
+  background sound, or words replayed from the previous segment) are dropped, so they no longer
+  start a user turn or interrupt the bot. Finals get a 1.5 s grace after the VAD stops.
+
 ### Changed
 
 - The package now has its own repository,

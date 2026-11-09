@@ -36,8 +36,12 @@ from pipecat.frames.frames import (
     Frame,
     InterimTranscriptionFrame,
     TranscriptionFrame,
+    VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
+
+# Results arriving this long after local VAD last heard speech are background sound, not the user.
+_VAD_GRACE_S = 1.5
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
 from pipecat.services.settings import STTSettings
 from pipecat.services.stt_service import WebsocketSTTService
@@ -354,6 +358,8 @@ class SaidwireSTTService(WebsocketSTTService):
             response = getattr(self._websocket, "response", None)
             if response is not None:
                 self._request_id = response.headers.get("x-request-id")
+            # word times restart at 0 on every new stream
+            self._last_final_end, self._last_final_word = 0.0, ""
             await self._call_event_handler("on_connected")
             logger.debug(f"{self}: connected (request_id={self._request_id})")
         except InvalidStatus as e:
@@ -426,6 +432,10 @@ class SaidwireSTTService(WebsocketSTTService):
             direction: The direction of frame processing.
         """
         await super().process_frame(frame, direction)
+        if isinstance(frame, VADUserStartedSpeakingFrame):
+            self._vad_speaking = True
+        elif isinstance(frame, VADUserStoppedSpeakingFrame):
+            self._vad_speaking, self._vad_stopped_at = False, time.monotonic()
         if isinstance(frame, VADUserStoppedSpeakingFrame) and self._vad_force_finalize:
             if self._websocket and self._websocket.state is State.OPEN:
                 self.request_finalize()
@@ -482,12 +492,59 @@ class SaidwireSTTService(WebsocketSTTService):
             return Language(language)
         return None
 
+    def _dedupe_final(self, alt: dict, transcript: str, persist: bool = True) -> str:
+        """Drop words an earlier final already delivered.
+
+        A ``Finalize`` that lands mid-word can make the server repeat the word at the cut
+        ("coffee shops" + "shop" + "shops near me"). Word timings tell us what was already sent.
+        """
+        words = alt.get("words") or []
+        if not words:
+            return transcript
+        last_end = getattr(self, "_last_final_end", 0.0)
+        last_word = getattr(self, "_last_final_word", "")
+        kept = []
+        for w in words:
+            start, end = float(w.get("start", 0.0)), float(w.get("end", 0.0))
+            text = (w.get("punctuated_word") or w.get("word") or "").strip()
+            norm = text.lower().strip(".,?!;:")
+            if end <= last_end + 0.02:
+                continue  # inside audio an earlier final already covered
+            if (not kept and last_word and start < last_end + 0.35
+                    and (norm.startswith(last_word) or last_word.startswith(norm))):
+                continue  # the word at the cut, decoded again
+            kept.append(text)
+            last_end, last_word = max(last_end, end), norm
+        if persist:
+            self._last_final_end, self._last_final_word = last_end, last_word
+        return " ".join(kept)
+
     async def _on_results(self, data: dict):
         alts = (data.get("channel") or {}).get("alternatives") or []
         transcript = (alts[0].get("transcript") or "").strip() if alts else ""
         lang = self._language()
+        logger.trace(
+            f"{self}: result final={bool(data.get('is_final'))} "
+            f"finalize={bool(data.get('from_finalize'))} start={data.get('start')} "
+            f"dur={data.get('duration')} text={transcript!r}"
+        )
+        # Only trust words while local VAD hears speech (or just after it stops). Faint TV or
+        # room sound that VAD ignores must not become a user turn or interrupt the bot.
+        speaking = getattr(self, "_vad_speaking", False)
+        stopped_at = getattr(self, "_vad_stopped_at", None)
+        # no VAD in the pipeline (no VAD frames ever seen): never gate. Interims only count
+        # while the user is speaking; finals also get a short grace after VAD stops.
+        is_final = bool(data.get("is_final"))
+        if (transcript and stopped_at is not None and not speaking
+                and (not is_final or time.monotonic() - stopped_at > _VAD_GRACE_S)):
+            logger.debug(f"{self}: dropped (no speech heard by VAD): {transcript!r}")
+            if data.get("is_final") and data.get("from_finalize"):
+                self.confirm_finalize()
+            return
 
         if data.get("is_final"):
+            if alts:
+                transcript = self._dedupe_final(alts[0], transcript)
             from_finalize = bool(data.get("from_finalize"))
             if from_finalize:
                 self.confirm_finalize()
@@ -505,7 +562,9 @@ class SaidwireSTTService(WebsocketSTTService):
                 self._finalize_pending = False
                 await self.stop_ttfb_metrics()
                 await self._cancel_ttfb_timeout()
-        elif transcript:
+        elif transcript and alts and self._dedupe_final(alts[0], transcript, persist=False):
+            # interims must not replay words an earlier final already delivered
+            transcript = self._dedupe_final(alts[0], transcript, persist=False)
             await self.push_frame(
                 InterimTranscriptionFrame(
                     transcript, self._user_id, time_now_iso8601(), lang, result=data
